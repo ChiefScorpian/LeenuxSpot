@@ -1,0 +1,2185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# LeenuxSpot Controller
+# ============================================================
+
+VERSION="0.7.0"
+
+UPSTREAM_IF="wlan0"
+HOTSPOT_IF="wlan1"
+HOTSPOT_CONN="LeenuxSpot"
+
+HOTSPOT_NET="192.168.50.0/24"
+HOTSPOT_GW="192.168.50.1"
+
+POLICY_TABLE="leenux-policy"
+POLICY_CHAIN="forward"
+BLOCKED_SET="blocked_clients"
+
+LEASE_FILE="/var/lib/NetworkManager/dnsmasq-wlan1.leases"
+
+CONFIG_DIR="/etc/leenux"
+CONFIG_FILE="$CONFIG_DIR/leenux.conf"
+
+# Load persistent LeenuxSpot configuration.
+# Only root can write this file.
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+
+DNSMASQ_SHARED_DIR="/etc/NetworkManager/dnsmasq-shared.d"
+DOMAIN_FILE="$CONFIG_DIR/blocked-domains"
+DNSMASQ_DOMAIN_FILE="$DNSMASQ_SHARED_DIR/50-leenux-domains.conf"
+
+BLOCKPAGE_DIR="/usr/local/libexec"
+BLOCKPAGE_SCRIPT="$BLOCKPAGE_DIR/leenux-blockpage.py"
+BLOCKPAGE_SERVICE="/etc/systemd/system/leenux-blockpage.service"
+
+BLOCKPAGE_ADDRESS="192.168.50.1"
+BLOCKPAGE_PORT="80"
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "run this command with sudo"
+}
+
+have_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+valid_mac() {
+    [[ "$1" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]
+}
+
+normalize_mac() {
+    printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+valid_domain() {
+    [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
+}
+
+normalize_domain() {
+    local d="${1:-}"
+
+    d="${d#http://}"
+    d="${d#https://}"
+    d="${d%%/*}"
+    d="${d%%\?*}"
+    d="${d%%\#*}"
+    d="${d%.}"
+
+    printf '%s\n' "$d" | tr '[:upper:]' '[:lower:]'
+}
+
+nft_table_exists() {
+    nft list table ip "$POLICY_TABLE" >/dev/null 2>&1
+}
+
+nft_set_exists() {
+    nft list set ip "$POLICY_TABLE" "$BLOCKED_SET" >/dev/null 2>&1
+}
+
+nft_chain_exists() {
+    nft list chain ip "$POLICY_TABLE" "$POLICY_CHAIN" >/dev/null 2>&1
+}
+
+setup_hotspot() {
+    local ssid=""
+    local password=""
+    local upstream=""
+    local hotspot=""
+    local existing=""
+
+    # --------------------------------------------------------
+    # Parse arguments
+    # --------------------------------------------------------
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+
+            --name)
+                [[ $# -ge 2 ]] ||
+                    die "--name requires a value"
+                ssid="$2"
+                shift 2
+                ;;
+
+            --password)
+                [[ $# -ge 2 ]] ||
+                    die "--password requires a value"
+                password="$2"
+                shift 2
+                ;;
+
+            --upstream)
+                [[ $# -ge 2 ]] ||
+                    die "--upstream requires a value"
+                upstream="$2"
+                shift 2
+                ;;
+
+            --hotspot)
+                [[ $# -ge 2 ]] ||
+                    die "--hotspot requires a value"
+                hotspot="$2"
+                shift 2
+                ;;
+
+            *)
+                die "unknown setup option: $1"
+                ;;
+        esac
+    done
+
+    # --------------------------------------------------------
+    # Validate SSID
+    # --------------------------------------------------------
+
+    if [[ -z "$ssid" ]]; then
+        read -r -p "Hotspot name [LeenuxSpot]: " ssid
+        ssid="${ssid:-LeenuxSpot}"
+    fi
+
+    [[ -n "$ssid" ]] ||
+        die "hotspot name cannot be empty"
+
+    if (( ${#ssid} > 32 )); then
+        die "hotspot name must be 32 characters or fewer"
+    fi
+
+    # --------------------------------------------------------
+    # Validate password
+    # --------------------------------------------------------
+
+    if [[ -z "$password" ]]; then
+        read -r -s -p "Hotspot password: " password
+        echo
+    fi
+
+    if (( ${#password} < 8 )); then
+        die "hotspot password must be at least 8 characters"
+    fi
+
+    if (( ${#password} > 63 )); then
+        die "hotspot password must be 63 characters or fewer"
+    fi
+
+    # --------------------------------------------------------
+    # Check NetworkManager
+    # --------------------------------------------------------
+
+    systemctl is-active --quiet NetworkManager ||
+        die "NetworkManager is not running"
+
+    have_cmd nmcli ||
+        die "nmcli is not installed"
+
+    # --------------------------------------------------------
+    # Discover Wi-Fi interfaces
+    # --------------------------------------------------------
+
+    mapfile -t wifi_interfaces < <(
+        nmcli -t -f DEVICE,TYPE device status 2>/dev/null |
+        awk -F: '$2 == "wifi" {print $1}'
+    )
+
+    if (( ${#wifi_interfaces[@]} == 0 )); then
+        die "no Wi-Fi interfaces were detected"
+    fi
+
+    echo
+    echo "Detected Wi-Fi interfaces:"
+    echo
+
+    local i
+    for i in "${!wifi_interfaces[@]}"; do
+        local dev="${wifi_interfaces[$i]}"
+        local state
+        local connection
+
+        state="$(
+            nmcli -t -f DEVICE,STATE device status |
+            awk -F: -v d="$dev" '$1 == d {print $2; exit}'
+        )"
+
+        connection="$(
+            nmcli -t -f DEVICE,CONNECTION device status |
+            awk -F: -v d="$dev" '$1 == d {$1=""; sub(/^:/,""); print; exit}'
+        )"
+
+        printf "  %d) %-12s state=%-12s connection=%s\n" \
+            "$((i + 1))" \
+            "$dev" \
+            "${state:---}" \
+            "${connection:---}"
+    done
+
+    echo
+
+    # --------------------------------------------------------
+    # Automatically determine upstream interface
+    #
+    # Prefer an interface which currently has a default route.
+    # --------------------------------------------------------
+
+    if [[ -z "$upstream" ]]; then
+        upstream="$(
+            ip route show default 2>/dev/null |
+            awk 'NR==1 {
+                for (i=1;i<=NF;i++)
+                    if ($i=="dev") {
+                        print $(i+1)
+                        exit
+                    }
+            }'
+        )"
+    fi
+
+    # Only use automatically detected upstream if it is Wi-Fi.
+    if [[ -n "$upstream" ]]; then
+        local upstream_is_wifi=0
+
+        for dev in "${wifi_interfaces[@]}"; do
+            if [[ "$dev" == "$upstream" ]]; then
+                upstream_is_wifi=1
+                break
+            fi
+        done
+
+        if (( upstream_is_wifi == 0 )); then
+            upstream=""
+        fi
+    fi
+
+    # --------------------------------------------------------
+    # Choose hotspot interface
+    # --------------------------------------------------------
+
+    if [[ -z "$hotspot" ]]; then
+        for dev in "${wifi_interfaces[@]}"; do
+            if [[ "$dev" != "$upstream" ]]; then
+                hotspot="$dev"
+                break
+            fi
+        done
+    fi
+
+    # --------------------------------------------------------
+    # If automatic detection wasn't possible, ask.
+    # --------------------------------------------------------
+
+    if [[ -z "$upstream" || -z "$hotspot" ]]; then
+        echo
+        echo "Select the upstream Wi-Fi interface."
+        echo "This is the interface that connects to the Internet."
+        echo
+
+        for i in "${!wifi_interfaces[@]}"; do
+            printf "  %d) %s\n" "$((i + 1))" "${wifi_interfaces[$i]}"
+        done
+
+        echo
+
+        local choice
+
+        if [[ -z "$upstream" ]]; then
+            read -r -p "Upstream interface number: " choice
+
+            [[ "$choice" =~ ^[0-9]+$ ]] ||
+                die "invalid interface selection"
+
+            (( choice >= 1 && choice <= ${#wifi_interfaces[@]} )) ||
+                die "invalid interface selection"
+
+            upstream="${wifi_interfaces[$((choice - 1))]}"
+        fi
+
+        if [[ -z "$hotspot" ]]; then
+            echo
+            echo "Select the hotspot Wi-Fi interface."
+            echo "This is the interface that creates the LeenuxSpot network."
+            echo
+
+            for i in "${!wifi_interfaces[@]}"; do
+                if [[ "${wifi_interfaces[$i]}" != "$upstream" ]]; then
+                    printf "  %d) %s\n" \
+                        "$((i + 1))" \
+                        "${wifi_interfaces[$i]}"
+                fi
+            done
+
+            echo
+
+            read -r -p "Hotspot interface number: " choice
+
+            [[ "$choice" =~ ^[0-9]+$ ]] ||
+                die "invalid interface selection"
+
+            (( choice >= 1 && choice <= ${#wifi_interfaces[@]} )) ||
+                die "invalid interface selection"
+
+            hotspot="${wifi_interfaces[$((choice - 1))]}"
+        fi
+    fi
+
+    [[ -n "$upstream" ]] ||
+        die "could not determine upstream interface"
+
+    [[ -n "$hotspot" ]] ||
+        die "could not determine hotspot interface"
+
+    [[ "$upstream" != "$hotspot" ]] ||
+        die "upstream and hotspot interfaces must be different"
+
+    # --------------------------------------------------------
+    # Verify interfaces exist
+    # --------------------------------------------------------
+
+    ip link show "$upstream" >/dev/null 2>&1 ||
+        die "upstream interface '$upstream' does not exist"
+
+    ip link show "$hotspot" >/dev/null 2>&1 ||
+        die "hotspot interface '$hotspot' does not exist"
+
+    # --------------------------------------------------------
+    # Check whether the requested hotspot connection exists.
+    # --------------------------------------------------------
+
+    existing="$(
+        nmcli -t -f NAME connection show 2>/dev/null |
+        grep -Fx "$ssid" || true
+    )"
+
+    if [[ -n "$existing" ]]; then
+        echo
+        echo "NetworkManager connection '$ssid' already exists."
+
+        if hotspot_active && [[ "$HOTSPOT_CONN" == "$ssid" ]]; then
+            echo "It is currently active."
+        fi
+
+        echo
+        read -r -p "Reconfigure this connection? [y/N]: " answer
+
+        case "$answer" in
+            y|Y|yes|YES)
+                nmcli connection delete "$ssid" >/dev/null 2>&1 || true
+                ;;
+            *)
+                die "setup cancelled"
+                ;;
+        esac
+    fi
+
+    # --------------------------------------------------------
+    # Create hotspot connection
+    # --------------------------------------------------------
+
+    echo
+    echo "Creating NetworkManager hotspot..."
+    echo
+    echo "  SSID:       $ssid"
+    echo "  Upstream:   $upstream"
+    echo "  Hotspot:    $hotspot"
+    echo "  Network:    $HOTSPOT_NET"
+    echo "  Gateway:    $HOTSPOT_GW"
+    echo
+
+    nmcli connection add \
+        type wifi \
+        ifname "$hotspot" \
+        con-name "$ssid" \
+        ssid "$ssid"
+
+    nmcli connection modify "$ssid" \
+        802-11-wireless.mode ap \
+        802-11-wireless.band bg \
+        wifi-sec.key-mgmt wpa-psk \
+        wifi-sec.psk "$password" \
+        ipv4.method shared \
+        ipv4.addresses "$HOTSPOT_GW/24" \
+        ipv6.method disabled \
+        connection.autoconnect no
+
+    # --------------------------------------------------------
+    # Update controller configuration.
+    # --------------------------------------------------------
+
+    mkdir -p "$CONFIG_DIR"
+
+    cat > "$CONFIG_FILE" <<EOF
+# LeenuxSpot configuration
+
+UPSTREAM_IF=$upstream
+HOTSPOT_IF=$hotspot
+HOTSPOT_CONN=$ssid
+HOTSPOT_NET=$HOTSPOT_NET
+HOTSPOT_GW=$HOTSPOT_GW
+EOF
+
+    chmod 600 "$CONFIG_FILE"
+
+    # Update runtime variables for this invocation.
+    UPSTREAM_IF="$upstream"
+    HOTSPOT_IF="$hotspot"
+    HOTSPOT_CONN="$ssid"
+
+    # --------------------------------------------------------
+    # Prepare Leenux services/policies.
+    # --------------------------------------------------------
+
+    enable_forwarding
+    ensure_policy
+    ensure_domain_files
+    ensure_blockpage
+
+    # --------------------------------------------------------
+    # Bring hotspot online.
+    # --------------------------------------------------------
+
+    echo
+    echo "Starting hotspot..."
+
+    nmcli connection up "$ssid"
+
+    echo
+    echo "=========================================="
+    echo " LeenuxSpot setup complete"
+    echo "=========================================="
+    echo
+    echo "SSID:           $ssid"
+    echo "Hotspot device: $hotspot"
+    echo "Upstream:       $upstream"
+    echo "Gateway:        $HOTSPOT_GW"
+    echo
+    echo "Test with:"
+    echo
+    echo "  sudo leenuxctl status"
+    echo "  sudo leenuxctl doctor"
+    echo
+}
+
+# ------------------------------------------------------------
+# NetworkManager / hotspot
+# ------------------------------------------------------------
+
+hotspot_exists() {
+    nmcli -t -f NAME connection show 2>/dev/null |
+        grep -Fxq "$HOTSPOT_CONN"
+}
+
+hotspot_active() {
+    nmcli -t -f NAME connection show --active 2>/dev/null |
+        grep -Fxq "$HOTSPOT_CONN"
+}
+
+ensure_hotspot() {
+    hotspot_exists ||
+        die "NetworkManager connection '$HOTSPOT_CONN' does not exist"
+
+    if ! hotspot_active; then
+        echo "Starting $HOTSPOT_CONN..."
+        nmcli connection up "$HOTSPOT_CONN"
+    fi
+}
+
+start_hotspot() {
+    ensure_hotspot
+    enable_forwarding
+    ensure_policy
+    ensure_domain_files
+    ensure_blockpage
+
+    echo "LeenuxSpot started."
+}
+
+stop_hotspot() {
+    if hotspot_active; then
+        nmcli connection down "$HOTSPOT_CONN"
+    fi
+
+    stop_blockpage
+
+    echo "LeenuxSpot stopped."
+}
+
+restart_hotspot() {
+    echo "Restarting LeenuxSpot..."
+
+    if hotspot_active; then
+        nmcli connection down "$HOTSPOT_CONN"
+    fi
+
+    sleep 1
+
+    nmcli connection up "$HOTSPOT_CONN"
+
+    enable_forwarding
+    ensure_policy
+    ensure_domain_files
+    ensure_blockpage
+
+    echo "LeenuxSpot restarted."
+}
+
+# ------------------------------------------------------------
+# IPv4 forwarding
+# ------------------------------------------------------------
+
+enable_forwarding() {
+    sysctl -q -w net.ipv4.ip_forward=1
+}
+
+disable_forwarding() {
+    sysctl -q -w net.ipv4.ip_forward=0
+}
+
+forwarding_enabled() {
+    [[ "$(sysctl -n net.ipv4.ip_forward)" == "1" ]]
+}
+
+# ------------------------------------------------------------
+# nftables policy
+# ------------------------------------------------------------
+
+ensure_policy_table() {
+    if ! nft_table_exists; then
+        nft add table ip "$POLICY_TABLE"
+    fi
+}
+
+ensure_blocked_set() {
+    ensure_policy_table
+
+    if ! nft_set_exists; then
+        nft add set ip "$POLICY_TABLE" "$BLOCKED_SET" \
+            '{ type ether_addr; }'
+    fi
+}
+
+ensure_policy_chain() {
+    ensure_policy_table
+
+    if ! nft_chain_exists; then
+        nft add chain ip "$POLICY_TABLE" "$POLICY_CHAIN" \
+            '{ type filter hook forward priority -10; policy accept; }'
+    fi
+}
+
+ensure_client_block_rule() {
+    ensure_policy_chain
+
+    if ! nft -a list chain ip "$POLICY_TABLE" "$POLICY_CHAIN" 2>/dev/null |
+        grep -Fq "iifname \"$HOTSPOT_IF\" ether saddr @$BLOCKED_SET drop"
+    then
+        nft add rule ip "$POLICY_TABLE" "$POLICY_CHAIN" \
+            iifname "$HOTSPOT_IF" ether saddr "@$BLOCKED_SET" drop
+    fi
+}
+
+ensure_policy() {
+    ensure_blocked_set
+    ensure_policy_chain
+    ensure_client_block_rule
+}
+
+client_is_blocked() {
+    local mac
+    mac="$(normalize_mac "$1")"
+
+    nft list set ip "$POLICY_TABLE" "$BLOCKED_SET" 2>/dev/null |
+        grep -qi "$mac"
+}
+
+# ------------------------------------------------------------
+# Client lookup
+# ------------------------------------------------------------
+
+lookup_client_mac() {
+    local target="$1"
+
+    if valid_mac "$target"; then
+        normalize_mac "$target"
+        return 0
+    fi
+
+    [[ -f "$LEASE_FILE" ]] || return 1
+
+    while read -r expiry mac ip hostname clientid; do
+        [[ -n "${mac:-}" ]] || continue
+
+        if [[ "$target" == "$ip" || "$target" == "$hostname" ]]; then
+            normalize_mac "$mac"
+            return 0
+        fi
+    done < "$LEASE_FILE"
+
+    return 1
+}
+
+lookup_client_info() {
+    local target="$1"
+    local wanted_mac
+
+    wanted_mac="$(lookup_client_mac "$target")" ||
+        return 1
+
+    while read -r expiry mac ip hostname clientid; do
+        [[ -n "${mac:-}" ]] || continue
+
+        if [[ "$(normalize_mac "$mac")" == "$wanted_mac" ]]; then
+            echo "$expiry|$wanted_mac|$ip|$hostname|$clientid"
+            return 0
+        fi
+    done < "$LEASE_FILE"
+
+    echo "0|$wanted_mac|||"
+}
+
+# ------------------------------------------------------------
+# Client commands
+# ------------------------------------------------------------
+
+block_client() {
+    local target="$1"
+    local mac
+
+    mac="$(lookup_client_mac "$target")" ||
+        die "could not resolve client '$target' to a MAC address"
+
+    ensure_policy
+
+    if client_is_blocked "$mac"; then
+        echo "Client $mac is already blocked."
+        return 0
+    fi
+
+    nft add element ip "$POLICY_TABLE" "$BLOCKED_SET" \
+        "{ $mac }"
+
+    echo "Blocked client $mac."
+}
+
+unblock_client() {
+    local target="$1"
+    local mac
+
+    mac="$(lookup_client_mac "$target")" ||
+        die "could not resolve client '$target' to a MAC address"
+
+    ensure_policy
+
+    if ! client_is_blocked "$mac"; then
+        echo "Client $mac is not blocked."
+        return 0
+    fi
+
+    nft delete element ip "$POLICY_TABLE" "$BLOCKED_SET" \
+        "{ $mac }"
+
+    echo "Unblocked client $mac."
+}
+
+client_status() {
+    local target="$1"
+    local info
+    local expiry mac ip hostname clientid
+    local neighbor="not currently present"
+
+    info="$(lookup_client_info "$target")" ||
+        die "client '$target' was not found in the DHCP leases"
+
+    IFS='|' read -r expiry mac ip hostname clientid <<< "$info"
+
+    if [[ -n "$ip" ]] &&
+       ip neigh show dev "$HOTSPOT_IF" 2>/dev/null |
+       grep -Fq "$ip "
+    then
+        neighbor="present"
+    fi
+
+    echo
+    echo "LeenuxSpot Client"
+    echo "================="
+    echo
+    echo "MAC:       $mac"
+    echo "IP:        ${ip:---}"
+    echo "Hostname:  ${hostname:---}"
+
+    if [[ "$expiry" != "0" && -n "$expiry" ]]; then
+        echo "Lease:     $(date -d "@$expiry" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$expiry")"
+    else
+        echo "Lease:     --"
+    fi
+
+    echo "Neighbor:  $neighbor"
+
+    if client_is_blocked "$mac"; then
+        echo "Internet:  BLOCKED"
+    else
+        echo "Internet:  ALLOWED"
+    fi
+
+    echo
+}
+
+client_list() {
+    echo
+    echo "LeenuxSpot Clients"
+    echo "=================="
+    echo
+
+    if [[ ! -s "$LEASE_FILE" ]]; then
+        echo "No DHCP leases."
+        return 0
+    fi
+
+    printf "%-18s %-16s %-24s %s\n" \
+        "MAC" "IP" "HOSTNAME" "POLICY"
+
+    while read -r expiry mac ip hostname clientid; do
+        [[ -n "${mac:-}" ]] || continue
+
+        local policy="ALLOWED"
+
+        if client_is_blocked "$mac"; then
+            policy="BLOCKED"
+        fi
+
+        printf "%-18s %-16s %-24s %s\n" \
+            "$mac" \
+            "$ip" \
+            "${hostname:---}" \
+            "$policy"
+
+    done < "$LEASE_FILE"
+
+    echo
+}
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+
+ensure_config() {
+    mkdir -p "$CONFIG_DIR"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<EOF
+# LeenuxSpot configuration
+
+UPSTREAM_IF=$UPSTREAM_IF
+HOTSPOT_IF=$HOTSPOT_IF
+HOTSPOT_CONN=$HOTSPOT_CONN
+HOTSPOT_NET=$HOTSPOT_NET
+HOTSPOT_GW=$HOTSPOT_GW
+EOF
+
+        chmod 600 "$CONFIG_FILE"
+    fi
+}
+
+# ------------------------------------------------------------
+# DNS/domain blocking
+# ------------------------------------------------------------
+
+ensure_domain_files() {
+    ensure_config
+
+    mkdir -p "$DNSMASQ_SHARED_DIR"
+
+    touch "$DOMAIN_FILE"
+    chmod 600 "$DOMAIN_FILE"
+
+    {
+        echo "# Generated by leenuxctl."
+        echo "# Do not edit this file manually."
+        echo
+        echo "# Blocked domains return the LeenuxSpot block-page address."
+        echo
+
+        while IFS= read -r blocked_domain; do
+            [[ -z "$blocked_domain" ]] && continue
+            [[ "$blocked_domain" == \#* ]] && continue
+
+            blocked_domain="$(normalize_domain "$blocked_domain")"
+
+            [[ -n "$blocked_domain" ]] || continue
+
+            echo "address=/$blocked_domain/$BLOCKPAGE_ADDRESS"
+        done < "$DOMAIN_FILE"
+
+    } > "$DNSMASQ_DOMAIN_FILE"
+
+    chmod 644 "$DNSMASQ_DOMAIN_FILE"
+}
+
+domain_blocked() {
+    local domain
+
+    domain="$(normalize_domain "$1")"
+
+    [[ -n "$domain" ]] || return 1
+
+    grep -Fxq "$domain" "$DOMAIN_FILE" 2>/dev/null
+}
+
+dnsmasq_running() {
+    pgrep -x dnsmasq >/dev/null 2>&1
+}
+
+reload_dns() {
+    ensure_domain_files
+
+    echo "Reloading NetworkManager shared DNS..."
+
+    if hotspot_active; then
+        nmcli connection down "$HOTSPOT_CONN" >/dev/null
+        sleep 1
+        nmcli connection up "$HOTSPOT_CONN" >/dev/null
+    fi
+}
+
+kill_domain_connections() {
+    local domain="$1"
+    local ip
+    local count=0
+
+    if ! command -v conntrack >/dev/null 2>&1; then
+        echo "Warning: conntrack is not installed; cannot terminate existing connections."
+        echo "Install it with your distribution's conntrack package."
+        return 1
+    fi
+
+    echo "Terminating existing IPv4 connections for: $domain"
+
+    # Resolve current IPv4 addresses.
+    while IFS= read -r ip; do
+        [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+
+        echo "  Terminating connections to $ip"
+
+        conntrack -D \
+            -s "$HOTSPOT_NET" \
+            -d "$ip" >/dev/null 2>&1 || true
+
+        count=$((count + 1))
+    done < <(
+        dig @"$HOTSPOT_GW" "$domain" A \
+            +time=2 +tries=1 +short 2>/dev/null |
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+            sort -u
+    )
+
+    echo "Connection termination attempted for $count address(es)."
+}
+
+domain_block() {
+    local domain="${1:-}"
+    local kill_connections=0
+
+    [[ -n "$domain" ]] ||
+        die "usage: leenuxctl domain block <domain> [--kill]"
+
+    if [[ "${2:-}" == "--kill" ]]; then
+        kill_connections=1
+    elif [[ -n "${2:-}" ]]; then
+        die "usage: leenuxctl domain block <domain> [--kill]"
+    fi
+
+    domain="$(normalize_domain "$domain")"
+
+    valid_domain "$domain" ||
+        die "invalid domain: $domain"
+
+    ensure_domain_files
+
+    if domain_blocked "$domain"; then
+        echo "Domain already blocked: $domain"
+
+        if (( kill_connections )); then
+            kill_domain_connections "$domain" || true
+        fi
+
+        return 0
+    fi
+
+    printf '%s\n' "$domain" >> "$DOMAIN_FILE"
+
+    grep -v '^[[:space:]]*$' "$DOMAIN_FILE" |
+        grep -v '^#' |
+        sort -u > "${DOMAIN_FILE}.tmp"
+
+    mv "${DOMAIN_FILE}.tmp" "$DOMAIN_FILE"
+    chmod 600 "$DOMAIN_FILE"
+
+    ensure_domain_files
+    reload_dns
+
+    echo "Blocked domain: $domain"
+
+    if (( kill_connections )); then
+        kill_domain_connections "$domain" || true
+    fi
+}
+
+domain_unblock() {
+    local domain="${1:-}"
+    local tmp
+
+    [[ -n "$domain" ]] ||
+        die "usage: leenuxctl domain unblock <domain>"
+
+    domain="$(normalize_domain "$domain")"
+
+    valid_domain "$domain" ||
+        die "invalid domain: $domain"
+
+    ensure_domain_files
+
+    if ! domain_blocked "$domain"; then
+        echo "Domain is not blocked: $domain"
+        return 0
+    fi
+
+    tmp="$(mktemp)"
+
+    grep -Fxv "$domain" "$DOMAIN_FILE" > "$tmp" || true
+
+    mv "$tmp" "$DOMAIN_FILE"
+    chmod 600 "$DOMAIN_FILE"
+
+    ensure_domain_files
+    reload_dns
+
+    echo "Unblocked domain: $domain"
+}
+
+domain_list() {
+    ensure_domain_files
+
+    echo
+    echo "LeenuxSpot Blocked Domains"
+    echo "=========================="
+    echo
+
+    if [[ ! -s "$DOMAIN_FILE" ]]; then
+        echo "No blocked domains."
+    else
+        nl -ba "$DOMAIN_FILE"
+    fi
+
+    echo
+}
+
+domain_clear() {
+    ensure_domain_files
+
+    : > "$DOMAIN_FILE"
+    chmod 600 "$DOMAIN_FILE"
+
+    ensure_domain_files
+    reload_dns
+
+    echo "Cleared all blocked domains."
+}
+
+domain_status() {
+    ensure_domain_files
+
+    local count
+
+    count="$(
+        grep -v '^[[:space:]]*$' "$DOMAIN_FILE" 2>/dev/null |
+        grep -v '^#' 2>/dev/null |
+        wc -l
+    )"
+
+    echo
+    echo "LeenuxSpot DNS Blocking"
+    echo "======================="
+    echo
+    echo "Blocked domains: $count"
+    echo "DNS target:      $BLOCKPAGE_ADDRESS"
+    echo "DNS config:      $DNSMASQ_DOMAIN_FILE"
+    echo "Domain database: $DOMAIN_FILE"
+
+    if dnsmasq_running; then
+        echo "dnsmasq:          running"
+    else
+        echo "dnsmasq:          not detected"
+    fi
+
+    echo
+}
+
+# ------------------------------------------------------------
+# Categories
+# ------------------------------------------------------------
+
+CATEGORY_DIR="/etc/leenux/categories"
+CATEGORY_STATE_DIR="/etc/leenux/enabled-categories"
+
+category_exists() {
+    [[ -f "$CATEGORY_DIR/$1" ]]
+}
+
+category_enabled() {
+    [[ -f "$CATEGORY_STATE_DIR/$1" ]]
+}
+
+category_list() {
+    mkdir -p "$CATEGORY_DIR" "$CATEGORY_STATE_DIR"
+
+    echo
+    echo "LeenuxSpot Categories"
+    echo "====================="
+    echo
+
+    local found=0
+    local category
+
+    for category_file in "$CATEGORY_DIR"/*; do
+        [[ -f "$category_file" ]] || continue
+
+        category="${category_file##*/}"
+        found=1
+
+        if category_enabled "$category"; then
+            printf "  %-20s ENABLED\n" "$category"
+        else
+            printf "  %-20s disabled\n" "$category"
+        fi
+    done
+
+    if (( found == 0 )); then
+        echo "No categories installed."
+    fi
+
+    echo
+}
+
+category_enable() {
+    local category="${1:-}"
+    local domain
+    local normalized
+    local tmp
+
+    [[ -n "$category" ]] ||
+        die "usage: leenuxctl category enable <category>"
+
+    category_exists "$category" ||
+        die "unknown category: $category"
+
+    mkdir -p "$CATEGORY_STATE_DIR"
+
+    if category_enabled "$category"; then
+        echo "Category already enabled: $category"
+        return 0
+    fi
+
+    ensure_domain_files
+
+    while IFS= read -r category_domain; do
+        [[ -z "$category_domain" ]] && continue
+        [[ "$category_domain" == \#* ]] && continue
+
+        normalized="$(normalize_domain "$category_domain")"
+
+        [[ -n "$normalized" ]] || continue
+        valid_domain "$normalized" || continue
+
+        if ! grep -Fxq "$normalized" "$DOMAIN_FILE"; then
+            printf '%s\n' "$normalized" >> "$DOMAIN_FILE"
+        fi
+    done < "$CATEGORY_DIR/$category"
+
+    tmp="$(mktemp)"
+
+    grep -v '^[[:space:]]*$' "$DOMAIN_FILE" |
+        grep -v '^#' |
+        sort -u > "$tmp"
+
+    mv "$tmp" "$DOMAIN_FILE"
+    chmod 600 "$DOMAIN_FILE"
+
+    touch "$CATEGORY_STATE_DIR/$category"
+
+    ensure_domain_files
+    reload_dns
+
+    echo "Enabled category: $category"
+}
+
+category_disable() {
+    local category="${1:-}"
+    local tmp
+    local domain
+    local other_category
+    local still_used
+
+    [[ -n "$category" ]] ||
+        die "usage: leenuxctl category disable <category>"
+
+    category_exists "$category" ||
+        die "unknown category: $category"
+
+    mkdir -p "$CATEGORY_STATE_DIR"
+
+    if ! category_enabled "$category"; then
+        echo "Category is not enabled: $category"
+        return 0
+    fi
+
+    ensure_domain_files
+
+    tmp="$(mktemp)"
+
+    while IFS= read -r domain; do
+        [[ -z "$domain" ]] && continue
+        [[ "$domain" == \#* ]] && continue
+
+        still_used=0
+
+        for other_file in "$CATEGORY_STATE_DIR"/*; do
+            [[ -f "$other_file" ]] || continue
+
+            other_category="${other_file##*/}"
+
+            [[ "$other_category" == "$category" ]] && continue
+
+            if grep -Fxq "$domain" "$CATEGORY_DIR/$other_category" 2>/dev/null; then
+                still_used=1
+                break
+            fi
+        done
+
+        if ! grep -Fxq "$domain" "$CATEGORY_DIR/$category" 2>/dev/null ||
+           (( still_used )); then
+            printf '%s\n' "$domain" >> "$tmp"
+        fi
+    done < "$DOMAIN_FILE"
+
+    mv "$tmp" "$DOMAIN_FILE"
+    chmod 600 "$DOMAIN_FILE"
+
+    rm -f "$CATEGORY_STATE_DIR/$category"
+
+    ensure_domain_files
+    reload_dns
+
+    echo "Disabled category: $category"
+}
+
+category_show() {
+    local category="${1:-}"
+
+    [[ -n "$category" ]] ||
+        die "usage: leenuxctl category show <category>"
+
+    category_exists "$category" ||
+        die "unknown category: $category"
+
+    echo
+    echo "Category: $category"
+    echo "===================="
+    echo
+
+    cat "$CATEGORY_DIR/$category"
+
+    echo
+}
+
+category_status() {
+    category_list
+}
+
+# ------------------------------------------------------------
+# DNS diagnostics
+# ------------------------------------------------------------
+
+dns_test() {
+    local domain="${1:-}"
+
+    [[ -n "$domain" ]] ||
+        die "usage: leenuxctl dns-test <domain>"
+
+    domain="$(normalize_domain "$domain")"
+
+    valid_domain "$domain" ||
+        die "invalid domain: $domain"
+
+    ensure_domain_files
+
+    echo
+    echo "LeenuxSpot DNS Test"
+    echo "==================="
+    echo
+    echo "DNS server: $HOTSPOT_GW"
+    echo "Domain:     $domain"
+    echo
+
+    if ! have_cmd dig; then
+        echo "dig is not installed."
+        return 1
+    fi
+
+    echo "--- A ---"
+
+    if dig @"$HOTSPOT_GW" "$domain" A +time=2 +tries=1 +noall +answer; then
+        :
+    else
+        echo "A query failed."
+    fi
+
+    echo
+    echo "--- AAAA ---"
+
+    if dig @"$HOTSPOT_GW" "$domain" AAAA +time=2 +tries=1 +noall +answer; then
+        :
+    else
+        echo "AAAA query failed."
+    fi
+
+    echo
+    echo "--- Block status ---"
+
+    if domain_blocked "$domain"; then
+        echo "Domain policy: BLOCKED"
+    else
+        echo "Domain policy: ALLOWED"
+    fi
+
+    echo
+    echo "--- Generated dnsmasq rule ---"
+
+    if grep -Fq "address=/$domain/$BLOCKPAGE_ADDRESS" "$DNSMASQ_DOMAIN_FILE" 2>/dev/null; then
+        echo "Rule:           PRESENT"
+        echo "Target:         $BLOCKPAGE_ADDRESS"
+    else
+        echo "Rule:           NOT PRESENT"
+    fi
+
+    echo
+}
+
+# ------------------------------------------------------------
+# Block page server
+# ------------------------------------------------------------
+
+install_blockpage() {
+    mkdir -p "$BLOCKPAGE_DIR"
+
+    cat > "$BLOCKPAGE_SCRIPT" <<'PYEOF'
+#!/usr/bin/env python3
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import html
+
+ADDRESS = "192.168.50.1"
+PORT = 80
+
+
+class BlockPageHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        host = self.headers.get("Host", "blocked site")
+        host = host.split(":")[0]
+
+        safe_host = html.escape(host)
+
+        body = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LeenuxSpot — Site Blocked</title>
+
+<style>
+:root {{
+    color-scheme: dark;
+}}
+
+body {{
+    background:#0b0f14;
+    color:#e8edf2;
+    font-family:system-ui,-apple-system,BlinkMacSystemFont,
+                 "Segoe UI",sans-serif;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    min-height:100vh;
+    margin:0;
+}}
+
+.card {{
+    width:min(90%,650px);
+    margin:24px;
+    padding:40px;
+    box-sizing:border-box;
+    background:#151b23;
+    border:1px solid #2b3542;
+    border-radius:18px;
+    box-shadow:0 20px 60px rgba(0,0,0,.45);
+    text-align:center;
+}}
+
+h1 {{
+    margin:0 0 12px;
+    color:#ff6b6b;
+    font-size:2rem;
+}}
+
+p {{
+    color:#b9c3cf;
+    line-height:1.6;
+}}
+
+.domain {{
+    background:#0b0f14;
+    color:#8bd5ff;
+    padding:12px 16px;
+    border-radius:10px;
+    word-break:break-all;
+    margin:20px 0;
+    font-family:monospace;
+}}
+
+.small {{
+    color:#718096;
+    font-size:.85rem;
+    margin-top:25px;
+}}
+</style>
+</head>
+
+<body>
+<div class="card">
+<h1>Site Blocked</h1>
+
+<p>
+This website has been blocked by the
+<strong>LeenuxSpot</strong> network.
+</p>
+
+<div class="domain">{safe_host}</div>
+
+<p>
+If you believe this site should be accessible,
+contact the network administrator.
+</p>
+
+<div class="small">
+LeenuxSpot Router
+</div>
+
+</div>
+</body>
+</html>
+"""
+
+        encoded = body.encode("utf-8")
+
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "text/html; charset=utf-8"
+        )
+        self.send_header(
+            "Content-Length",
+            str(len(encoded))
+        )
+        self.send_header(
+            "Cache-Control",
+            "no-store, no-cache, must-revalidate"
+        )
+        self.send_header("Pragma", "no-cache")
+        self.end_headers()
+
+        self.wfile.write(encoded)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "text/html; charset=utf-8"
+        )
+        self.send_header(
+            "Cache-Control",
+            "no-store"
+        )
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+server = ThreadingHTTPServer(
+    (ADDRESS, PORT),
+    BlockPageHandler
+)
+
+server.serve_forever()
+PYEOF
+
+    chmod 755 "$BLOCKPAGE_SCRIPT"
+
+    cat > "$BLOCKPAGE_SERVICE" <<EOF
+[Unit]
+Description=LeenuxSpot Block Page
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 $BLOCKPAGE_SCRIPT
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+}
+
+ensure_blockpage() {
+    install_blockpage
+
+    if ! systemctl is-enabled --quiet leenux-blockpage.service 2>/dev/null; then
+        systemctl enable leenux-blockpage.service >/dev/null
+    fi
+
+    if ! systemctl is-active --quiet leenux-blockpage.service; then
+        systemctl start leenux-blockpage.service
+    fi
+}
+
+stop_blockpage() {
+    if systemctl is-active --quiet leenux-blockpage.service 2>/dev/null; then
+        systemctl stop leenux-blockpage.service
+    fi
+}
+
+# ------------------------------------------------------------
+# Router modes
+# ------------------------------------------------------------
+
+delete_rule_matching() {
+    local needle="$1"
+    local handle
+
+    while nft -a list chain ip "$POLICY_TABLE" "$POLICY_CHAIN" 2>/dev/null |
+        grep -Fq "$needle"
+    do
+        handle="$(
+            nft -a list chain ip "$POLICY_TABLE" "$POLICY_CHAIN" |
+                awk -v a="$needle" '
+                    index($0,a) {
+                        for(i=1;i<=NF;i++)
+                            if($i=="handle")
+                                print $(i+1)
+                    }' |
+                head -n1
+        )"
+
+        [[ -n "$handle" ]] || break
+
+        nft delete rule ip "$POLICY_TABLE" "$POLICY_CHAIN" \
+            handle "$handle"
+    done
+}
+
+mode_router() {
+    ensure_hotspot
+    enable_forwarding
+    ensure_policy
+
+    delete_rule_matching \
+        "iifname \"$HOTSPOT_IF\" oifname \"$UPSTREAM_IF\" drop"
+
+    delete_rule_matching \
+        "iifname \"$UPSTREAM_IF\" oifname \"$HOTSPOT_IF\" drop"
+
+    echo "Mode: router"
+}
+
+mode_lan_only() {
+    ensure_hotspot
+    enable_forwarding
+    ensure_policy
+
+    if ! nft -a list chain ip "$POLICY_TABLE" "$POLICY_CHAIN" |
+        grep -Fq "iifname \"$HOTSPOT_IF\" oifname \"$UPSTREAM_IF\" drop"
+    then
+        nft add rule ip "$POLICY_TABLE" "$POLICY_CHAIN" \
+            iifname "$HOTSPOT_IF" oifname "$UPSTREAM_IF" drop
+    fi
+
+    if ! nft -a list chain ip "$POLICY_TABLE" "$POLICY_CHAIN" |
+        grep -Fq "iifname \"$UPSTREAM_IF\" oifname \"$HOTSPOT_IF\" drop"
+    then
+        nft add rule ip "$POLICY_TABLE" "$POLICY_CHAIN" \
+            iifname "$UPSTREAM_IF" oifname "$HOTSPOT_IF" drop
+    fi
+
+    echo "Mode: lan-only"
+}
+
+mode_disabled() {
+    stop_hotspot
+    disable_forwarding
+
+    echo "Mode: disabled"
+}
+
+uninstall_hotspot() {
+    local remove_leenux=0
+
+    case "${1:-}" in
+        "")
+            ;;
+        --removeLeenux)
+            remove_leenux=1
+            ;;
+        *)
+            die "usage: leenuxctl uninstall [--removeLeenux]"
+            ;;
+    esac
+
+    echo
+    echo "LeenuxSpot Uninstall"
+    echo "===================="
+    echo
+
+    # Stop block-page service
+    if systemctl is-active --quiet leenux-blockpage.service 2>/dev/null; then
+        echo "Stopping block-page service..."
+        systemctl stop leenux-blockpage.service || true
+    fi
+
+    if systemctl is-enabled --quiet leenux-blockpage.service 2>/dev/null; then
+        echo "Disabling block-page service..."
+        systemctl disable leenux-blockpage.service >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$BLOCKPAGE_SERVICE"
+    systemctl daemon-reload
+
+    # Remove hotspot connection
+    if hotspot_exists; then
+        echo "Removing NetworkManager hotspot..."
+        nmcli connection down "$HOTSPOT_CONN" >/dev/null 2>&1 || true
+        nmcli connection delete "$HOTSPOT_CONN" >/dev/null 2>&1 || true
+    else
+        echo "NetworkManager hotspot connection not found."
+    fi
+
+    # Remove generated DNS configuration
+    if [[ -f "$DNSMASQ_DOMAIN_FILE" ]]; then
+        echo "Removing generated DNS configuration..."
+        rm -f "$DNSMASQ_DOMAIN_FILE"
+    fi
+
+    # Remove nftables policy
+    if nft_table_exists; then
+        echo "Removing Leenux nftables policy..."
+        nft delete table ip "$POLICY_TABLE" >/dev/null 2>&1 || true
+    fi
+
+    # Disable forwarding
+    if forwarding_enabled; then
+        echo "Disabling IPv4 forwarding..."
+        disable_forwarding
+    fi
+
+    # Remove block-page program
+    if [[ -f "$BLOCKPAGE_SCRIPT" ]]; then
+        echo "Removing block-page program..."
+        rm -f "$BLOCKPAGE_SCRIPT"
+    fi
+
+    # Remove Leenux configuration
+    if [[ -d "$CONFIG_DIR" ]]; then
+        echo "Removing Leenux configuration..."
+        rm -rf "$CONFIG_DIR"
+    fi
+
+    if (( remove_leenux )); then
+        echo
+        echo "Removing leenuxctl..."
+
+        rm -f "$TARGET"
+
+        echo
+        echo "LeenuxSpot has been completely removed."
+        echo "Your backup files were preserved."
+    else
+        echo
+        echo "LeenuxSpot has been uninstalled."
+        echo "leenuxctl was kept installed."
+        echo
+        echo "To remove it completely:"
+        echo
+        echo "  sudo leenuxctl uninstall --removeLeenux"
+    fi
+
+    echo
+}
+
+# ------------------------------------------------------------
+# Status
+# ------------------------------------------------------------
+
+status() {
+    echo
+    echo "LeenuxSpot Router"
+    echo "================="
+    echo
+
+    echo "System"
+    echo "  Version:            $VERSION"
+    echo "  Kernel:             $(uname -r)"
+
+    if systemctl is-active --quiet NetworkManager; then
+        echo "  NetworkManager:     active"
+    else
+        echo "  NetworkManager:     inactive"
+    fi
+
+    if nft list tables >/dev/null 2>&1; then
+        echo "  nftables:           available"
+    else
+        echo "  nftables:           unavailable"
+    fi
+
+    if forwarding_enabled; then
+        echo "  IPv4 forwarding:    enabled"
+    else
+        echo "  IPv4 forwarding:    disabled"
+    fi
+
+    echo
+
+    echo "Upstream"
+
+    local upstream_conn upstream_addr upstream_gw
+
+    upstream_conn="$(
+        nmcli -t -f GENERAL.CONNECTION device show "$UPSTREAM_IF" 2>/dev/null |
+            cut -d: -f2-
+    )"
+
+    upstream_addr="$(
+        nmcli -g IP4.ADDRESS device show "$UPSTREAM_IF" 2>/dev/null |
+            head -n1
+    )"
+
+    upstream_gw="$(
+        nmcli -g IP4.GATEWAY device show "$UPSTREAM_IF" 2>/dev/null |
+            head -n1
+    )"
+
+    echo "  Interface:          $UPSTREAM_IF"
+    echo "  Connection:         ${upstream_conn:---}"
+    echo "  Address:            ${upstream_addr:---}"
+    echo "  Gateway:            ${upstream_gw:---}"
+
+    echo
+
+    echo "Hotspot"
+
+    echo "  Interface:          $HOTSPOT_IF"
+
+    if hotspot_active; then
+        echo "  State:              connected"
+    else
+        echo "  State:              inactive"
+    fi
+
+    local ssid
+
+    ssid="$(
+        nmcli -g 802-11-wireless.ssid connection show "$HOTSPOT_CONN" 2>/dev/null |
+            head -n1
+    )"
+
+    echo "  SSID:               ${ssid:---}"
+
+    local hotspot_addr
+
+    hotspot_addr="$(
+        nmcli -g IP4.ADDRESS device show "$HOTSPOT_IF" 2>/dev/null |
+            head -n1
+    )"
+
+    echo "  Address:            ${hotspot_addr:---}"
+
+    echo
+
+    echo "Routing"
+
+    echo "  IPv4 forwarding:    $(forwarding_enabled && echo enabled || echo disabled)"
+
+    if nft list table ip nm-shared-wlan1 >/dev/null 2>&1; then
+        echo "  NetworkManager NAT: present"
+    else
+        echo "  NetworkManager NAT: missing"
+    fi
+
+    echo
+
+    echo "Internet Sharing"
+
+    if nft -a list chain ip "$POLICY_TABLE" "$POLICY_CHAIN" 2>/dev/null |
+        grep -Fq "iifname \"$HOTSPOT_IF\" oifname \"$UPSTREAM_IF\" drop"
+    then
+        echo "  Status:             OFF (LAN-only)"
+    else
+        echo "  Status:             ON"
+    fi
+
+    echo
+
+    echo "Client Policy"
+
+    local blocked_count=0
+
+    if nft list set ip "$POLICY_TABLE" "$BLOCKED_SET" >/dev/null 2>&1; then
+        blocked_count="$(
+            nft -a list set ip "$POLICY_TABLE" "$BLOCKED_SET" |
+                grep -oE '[0-9a-f]{2}(:[0-9a-f]{2}){5}' |
+                wc -l
+        )"
+    fi
+
+    echo "  Blocked clients:    $blocked_count"
+
+    echo
+
+    echo "DNS Blocking"
+
+    local domain_count=0
+
+    if [[ -f "$DOMAIN_FILE" ]]; then
+        domain_count="$(
+            grep -v '^[[:space:]]*$' "$DOMAIN_FILE" 2>/dev/null |
+            grep -v '^#' 2>/dev/null |
+            wc -l
+        )"
+    fi
+
+    echo "  Blocked domains:    $domain_count"
+    echo "  DNS config:         $DNSMASQ_DOMAIN_FILE"
+
+    if dnsmasq_running; then
+        echo "  dnsmasq:            running"
+    else
+        echo "  dnsmasq:            not detected"
+    fi
+
+    if systemctl is-active --quiet leenux-blockpage.service 2>/dev/null; then
+        echo "  Block page:         active"
+    else
+        echo "  Block page:         inactive"
+    fi
+
+    echo
+
+    echo "Clients"
+
+    local lease_count=0
+
+    if [[ -f "$LEASE_FILE" ]]; then
+        lease_count="$(wc -l < "$LEASE_FILE")"
+    fi
+
+    echo "  DHCP leases:        $lease_count"
+
+    echo
+}
+
+# ------------------------------------------------------------
+# Doctor
+# ------------------------------------------------------------
+
+doctor() {
+    local failures=0
+
+    echo
+    echo "LeenuxSpot Doctor"
+    echo "================="
+    echo
+
+    if systemctl is-active --quiet NetworkManager; then
+        echo "  ✓ NetworkManager is running"
+    else
+        echo "  ✗ NetworkManager is not running"
+        failures=$((failures + 1))
+    fi
+
+    if ip link show "$UPSTREAM_IF" >/dev/null 2>&1; then
+        echo "  ✓ $UPSTREAM_IF exists"
+    else
+        echo "  ✗ $UPSTREAM_IF missing"
+        failures=$((failures + 1))
+    fi
+
+    if ip link show "$HOTSPOT_IF" >/dev/null 2>&1; then
+        echo "  ✓ $HOTSPOT_IF exists"
+    else
+        echo "  ✗ $HOTSPOT_IF missing"
+        failures=$((failures + 1))
+    fi
+
+    if forwarding_enabled; then
+        echo "  ✓ IPv4 forwarding enabled"
+    else
+        echo "  ✗ IPv4 forwarding disabled"
+        failures=$((failures + 1))
+    fi
+
+    if hotspot_exists; then
+        echo "  ✓ LeenuxSpot profile exists"
+    else
+        echo "  ✗ LeenuxSpot profile missing"
+        failures=$((failures + 1))
+    fi
+
+    if nft list tables >/dev/null 2>&1; then
+        echo "  ✓ nftables is functional"
+    else
+        echo "  ✗ nftables is not functional"
+        failures=$((failures + 1))
+    fi
+
+    if nft list table ip nm-shared-wlan1 >/dev/null 2>&1; then
+        echo "  ✓ NetworkManager NAT exists"
+    else
+        echo "  ✗ NetworkManager NAT missing"
+        failures=$((failures + 1))
+    fi
+
+    ensure_policy
+
+    echo "  ✓ Leenux policy table exists"
+    echo "  ✓ Blocked-client set exists"
+    echo "  ✓ Leenux forward chain exists"
+
+    if nft -a list chain ip "$POLICY_TABLE" "$POLICY_CHAIN" 2>/dev/null |
+        grep -Fq "iifname \"$HOTSPOT_IF\" ether saddr @$BLOCKED_SET drop"
+    then
+        echo "  ✓ Client blocking rule exists"
+    else
+        echo "  ✗ Client blocking rule missing"
+        failures=$((failures + 1))
+    fi
+
+    ensure_domain_files
+
+    if [[ -f "$DNSMASQ_DOMAIN_FILE" ]]; then
+        echo "  ✓ DNS blocking configuration exists"
+    else
+        echo "  ✗ DNS blocking configuration missing"
+        failures=$((failures + 1))
+    fi
+
+    if grep -Fq "address=/" "$DNSMASQ_DOMAIN_FILE" 2>/dev/null; then
+        echo "  ✓ DNS A-record blocking configured"
+    else
+        echo "  ! No blocked-domain A-records configured"
+    fi
+
+    if systemctl is-active --quiet leenux-blockpage.service 2>/dev/null; then
+        echo "  ✓ Block page service running"
+    else
+        echo "  ✗ Block page service not running"
+        failures=$((failures + 1))
+    fi
+
+    echo
+
+    if (( failures == 0 )); then
+        echo "✓ No problems detected."
+        return 0
+    fi
+
+    echo "✗ $failures problem(s) detected."
+    return 1
+}
+
+# ------------------------------------------------------------
+# Policy display
+# ------------------------------------------------------------
+
+policy_show() {
+    echo
+    echo "LeenuxSpot Client Policy"
+    echo "========================"
+    echo
+
+    ensure_policy
+
+    nft list table ip "$POLICY_TABLE"
+}
+
+# ------------------------------------------------------------
+# Help
+# ------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+leenuxctl $VERSION
+
+Usage:
+
+Setup:
+
+  leenuxctl setup --name <SSID> --password <password>
+  leenuxctl setup --name <SSID> --password <password> \
+      --upstream <interface> --hotspot <interface>
+
+  leenuxctl status
+  leenuxctl doctor
+
+  leenuxctl start
+  leenuxctl stop
+  leenuxctl restart
+
+  leenuxctl mode router
+  leenuxctl mode lan-only
+  leenuxctl mode disabled
+
+Client management:
+
+  leenuxctl client list
+  leenuxctl client status <MAC|IP|hostname>
+  leenuxctl client block <MAC|IP|hostname>
+  leenuxctl client unblock <MAC|IP|hostname>
+
+DNS/domain blocking:
+
+  leenuxctl domain list
+  leenuxctl domain block <domain> [--kill]
+  leenuxctl domain unblock <domain>
+  leenuxctl domain clear
+  leenuxctl domain status
+  leenuxctl dns-test <domain>
+
+Policy:
+
+  leenuxctl policy show
+
+Examples:
+
+  sudo leenuxctl status
+  sudo leenuxctl doctor
+
+  sudo leenuxctl client list
+  sudo leenuxctl client block 46:55:2b:89:46:f6
+  sudo leenuxctl client unblock 46:55:2b:89:46:f6
+
+  sudo leenuxctl domain block example.com
+  sudo leenuxctl domain block example.com --kill
+  sudo leenuxctl domain list
+  sudo leenuxctl domain unblock example.com
+
+  sudo leenuxctl dns-test example.com
+
+Modes:
+
+  router       Normal Internet-sharing router mode
+  lan-only     Hotspot works, Internet access blocked
+  disabled     Hotspot disabled
+EOF
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+need_root
+
+case "${1:-}" in
+
+    status)
+        status
+        ;;
+
+    doctor)
+        doctor
+        ;;
+
+    start)
+        start_hotspot
+        ;;
+
+    stop)
+        stop_hotspot
+        ;;
+
+    restart)
+        restart_hotspot
+        ;;
+
+    setup)
+        shift
+        setup_hotspot "$@"
+        ;;
+
+    mode)
+        case "${2:-}" in
+            router)
+                mode_router
+                ;;
+            lan-only)
+                mode_lan_only
+                ;;
+            disabled)
+                mode_disabled
+                ;;
+            *)
+                die "usage: leenuxctl mode {router|lan-only|disabled}"
+                ;;
+        esac
+        ;;
+
+    client)
+        case "${2:-}" in
+
+            list)
+                ensure_policy
+                client_list
+                ;;
+
+            status)
+                [[ -n "${3:-}" ]] ||
+                    die "usage: leenuxctl client status <MAC|IP|hostname>"
+                ensure_policy
+                client_status "$3"
+                ;;
+
+            block)
+                [[ -n "${3:-}" ]] ||
+                    die "usage: leenuxctl client block <MAC|IP|hostname>"
+                ensure_policy
+                block_client "$3"
+                ;;
+
+            unblock)
+                [[ -n "${3:-}" ]] ||
+                    die "usage: leenuxctl client unblock <MAC|IP|hostname>"
+                ensure_policy
+                unblock_client "$3"
+                ;;
+
+            *)
+                die "usage: leenuxctl client {list|status|block|unblock} ..."
+                ;;
+        esac
+        ;;
+
+    domain)
+        case "${2:-}" in
+
+            list)
+                domain_list
+                ;;
+
+            block)
+                [[ -n "${3:-}" ]] ||
+                    die "usage: leenuxctl domain block <domain>"
+                domain_block "$3"
+                ;;
+
+            unblock)
+                [[ -n "${3:-}" ]] ||
+                    die "usage: leenuxctl domain unblock <domain>"
+                domain_unblock "$3"
+                ;;
+
+            clear)
+                domain_clear
+                ;;
+
+            status)
+                domain_status
+                ;;
+
+            *)
+                die "usage: leenuxctl domain {list|block|unblock|clear|status}"
+                ;;
+        esac
+        ;;
+
+    dns-test)
+        [[ -n "${2:-}" ]] ||
+            die "usage: leenuxctl dns-test <domain>"
+        dns_test "$2"
+        ;;
+
+    category)
+        case "${2:-}" in
+            list)
+                category_list
+                ;;
+            status)
+                category_status
+                ;;
+            show)
+                [[ -n "${3:-}" ]] ||
+                    die "usage: leenuxctl category show <category>"
+                category_show "$3"
+                ;;
+            enable)
+                [[ -n "${3:-}" ]] ||
+                    die "usage: leenuxctl category enable <category>"
+                category_enable "$3"
+                ;;
+            disable)
+                [[ -n "${3:-}" ]] ||
+                    die "usage: leenuxctl category disable <category>"
+                category_disable "$3"
+                ;;
+            *)
+                die "usage: leenuxctl category {list|status|show|enable|disable} ..."
+                ;;
+        esac
+        ;;
+
+    policy)
+        case "${2:-}" in
+            show)
+                policy_show
+                ;;
+            *)
+                die "usage: leenuxctl policy show"
+                ;;
+        esac
+        ;;
+
+    help|-h|--help)
+        usage
+        ;;
+
+    *)
+        usage
+        exit 1
+        ;;
+
+esac
