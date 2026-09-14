@@ -1,24 +1,79 @@
-LeenuxSpot
+# LeenuxSpot
 
-LeenuxSpot is a Linux network hotspot and traffic-control utility built around NetworkManager, nftables, dnsmasq, and systemd.
+LeenuxSpot is a Linux NetworkManager-based hotspot/router controller.
 
-It turns a Linux PC into a configurable Wi-Fi hotspot while providing tools for managing connected clients, controlling Internet access, blocking domains, managing category-based filtering, and displaying custom block pages.
+## Installation
 
-Features
-📡 Create and configure Wi-Fi hotspots through NetworkManager
-🔀 Share an existing Internet connection with connected devices
-👥 View and manage connected hotspot clients
-🚫 Block individual clients from accessing the Internet
-🌐 Block domains through DNS
-⚡ Terminate existing connections to blocked domains with --kill
-📚 Manage domain-blocking categories
-🛡️ nftables-based traffic policies
-🖥️ Custom LeenuxSpot block page
-🔍 Built-in diagnostics with status, doctor, and dns-test
-🔄 Router, LAN-only, and disabled modes
-🧹 Built-in uninstall and cleanup support
-💾 Automatic backups when updating an existing installation
+Run:
 
-LeenuxSpot is designed to be simple enough to set up with a single command while still providing powerful controls for users who want to manage traffic on their own Linux network.
+    sudo ./install.sh
 
-Linux → Wi-Fi Hotspot → LeenuxSpot → Connected Devices
+The installer installs:
+
+    /usr/local/bin/leenuxctl
+
+If an existing installation is found, it is backed up automatically.
+
+## Setup
+
+Create a hotspot:
+
+    sudo leenuxctl setup --name LeenuxSpot --password 'your-password'
+
+You can also specify the Wi-Fi interfaces:
+
+    sudo leenuxctl setup \
+        --name LeenuxSpot \
+        --password 'your-password' \
+        --upstream wlan0 \
+        --hotspot wlan1
+
+## Useful commands
+
+    sudo leenuxctl status
+    sudo leenuxctl doctor
+
+    sudo leenuxctl start
+    sudo leenuxctl stop
+    sudo leenuxctl restart
+
+## Domain blocking
+
+    sudo leenuxctl domain block example.com
+    sudo leenuxctl domain block example.com --kill
+    sudo leenuxctl domain unblock example.com
+    sudo leenuxctl domain list
+    sudo leenuxctl domain status
+
+## Client management
+
+    sudo leenuxctl client list
+    sudo leenuxctl client status <MAC|IP|hostname>
+    sudo leenuxctl client block <MAC|IP|hostname>
+    sudo leenuxctl client unblock <MAC|IP|hostname>
+
+## Modes
+
+    sudo leenuxctl mode router
+    sudo leenuxctl mode lan-only
+    sudo leenuxctl mode disabled
+
+## Runtime files
+
+LeenuxSpot creates its configuration at runtime.
+
+Configuration:
+
+    /etc/leenux/
+
+NetworkManager DNS configuration:
+
+    /etc/NetworkManager/dnsmasq-shared.d/
+
+Block-page service:
+
+    /etc/systemd/system/leenux-blockpage.service
+
+Controller:
+
+    /usr/local/bin/leenuxctl
